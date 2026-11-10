@@ -212,6 +212,26 @@ public static class Program
     public static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            if (e.ExceptionObject is Exception ex)
+            {
+                ShowFatalCrash(ex);
+            }
+        };
+
+        try
+        {
+            await RunAppAsync();
+        }
+        catch (Exception ex)
+        {
+            ShowFatalCrash(ex);
+        }
+    }
+
+    private static async Task RunAppAsync()
+    {
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
@@ -232,29 +252,63 @@ public static class Program
 
         using var client = new Client(ConfigCallback(sessionPath));
 
-        if (!string.IsNullOrWhiteSpace(_config.ProxyUrl))
+        PrintHeader("Telegram Dumper — Авторизация MTProto");
+
+        bool useProxy = !string.IsNullOrWhiteSpace(_config.ProxyUrl);
+        if (useProxy)
         {
-            client.MTProxyUrl = _config.ProxyUrl;
+            var (host, port, _) = ParseProxyUrl(_config.ProxyUrl!);
+            if ((host == "127.0.0.1" || host == "localhost") && !IsPortOpen(host, port, 600))
+            {
+                AnsiConsole.MarkupLine($"[bold yellow][[!] Локальный туннель {host}:{port} не отвечает (порт закрыт).[/]");
+                AnsiConsole.MarkupLine("[cyan][[*]] Автоматическое переключение на прямое подключение (Direct TCP)...[/]\n");
+                useProxy = false;
+            }
         }
 
-        PrintHeader("Telegram Dumper — Авторизация MTProto");
-        AnsiConsole.MarkupLine("[deepskyblue1][[*]] Установка соединения с Telegram через туннель...[/]");
+        if (useProxy)
+        {
+            client.MTProxyUrl = _config.ProxyUrl;
+            AnsiConsole.MarkupLine($"[deepskyblue1][[*]] Установка соединения с Telegram через туннель ({GetFriendlyProxyTitle(_config.ProxyUrl!)})...[/]");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine("[deepskyblue1][[*]] Установка прямого соединения с серверами Telegram...[/]");
+        }
 
-        User myUser;
+        User? myUser = null;
         try
         {
             myUser = await client.LoginUserIfNeeded();
         }
         catch (Exception ex)
         {
-            AnsiConsole.MarkupLine($"[bold red][[-]] Ошибка авторизации: {Markup.Escape(ex.Message)}[/]");
-            return;
+            if (useProxy)
+            {
+                AnsiConsole.MarkupLine($"\n[bold yellow][[!] Сбой подключения через туннель: {Markup.Escape(ex.Message)}[/]");
+                AnsiConsole.MarkupLine("[cyan][[*]] Пробуем автоматическое прямое подключение без туннеля...[/]");
+                try
+                {
+                    client.MTProxyUrl = null;
+                    myUser = await client.LoginUserIfNeeded();
+                }
+                catch (Exception directEx)
+                {
+                    ShowConnectionDiagnostics(directEx, _config.ProxyUrl);
+                    return;
+                }
+            }
+            else
+            {
+                ShowConnectionDiagnostics(ex, null);
+                return;
+            }
         }
 
-        myUser = client.User;
+        myUser ??= client.User;
         if (myUser == null)
         {
-            AnsiConsole.MarkupLine("[bold red][[-]] Не удалось получить объект пользователя Telegram.[/]");
+            ShowConnectionDiagnostics(new InvalidOperationException("Сервер Telegram не вернул профиль авторизованного пользователя."), _config.ProxyUrl);
             return;
         }
 
@@ -1234,7 +1288,7 @@ public static class Program
                 int port = root.TryGetProperty("port", out var p) ? p.GetInt32() : 1443;
                 string? secret = root.TryGetProperty("secret", out var s) ? s.GetString() : null;
 
-                if (!string.IsNullOrEmpty(secret))
+                if (!string.IsNullOrEmpty(secret) && IsPortOpen(host, port, 500))
                 {
                     cfg.ProxyUrl = $"tg://proxy?server={host}&port={port}&secret={secret}";
                     SaveConfig(cfg);
@@ -1340,6 +1394,168 @@ public static class Program
         }
         catch
         {
+        }
+    }
+
+    private static bool IsPortOpen(string host, int port, int timeoutMs = 600)
+    {
+        try
+        {
+            using var tcp = new System.Net.Sockets.TcpClient();
+            var ar = tcp.BeginConnect(host, port, null, null);
+            bool success = ar.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeoutMs));
+            if (!success) return false;
+            tcp.EndConnect(ar);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static (string host, int port, string? secret) ParseProxyUrl(string proxyUrl)
+    {
+        string host = "127.0.0.1";
+        int port = 1443;
+        string? secret = null;
+
+        var mHost = Regex.Match(proxyUrl, @"[?&]server=([^&]+)");
+        if (mHost.Success) host = mHost.Groups[1].Value;
+
+        var mPort = Regex.Match(proxyUrl, @"[?&]port=(\d+)");
+        if (mPort.Success && int.TryParse(mPort.Groups[1].Value, out int p)) port = p;
+
+        var mSecret = Regex.Match(proxyUrl, @"[?&]secret=([^&]+)");
+        if (mSecret.Success) secret = mSecret.Groups[1].Value;
+
+        return (host, port, secret);
+    }
+
+    private static string GetFriendlyProxyTitle(string proxyUrl)
+    {
+        var (host, port, _) = ParseProxyUrl(proxyUrl);
+        return $"{host}:{port}";
+    }
+
+    private static void ShowConnectionDiagnostics(Exception ex, string? proxyUrl)
+    {
+        Console.WriteLine();
+        var panel = new Table().Border(TableBorder.Rounded).BorderColor(Color.Red).Expand();
+        panel.AddColumn(new TableColumn("[bold red]ОШИБКА ПОДКЛЮЧЕНИЯ К TELEGRAM[/]"));
+
+        string exType = ex.GetType().Name;
+        string exMsg = ex.Message;
+        string socketCode = "";
+
+        if (ex is System.Net.Sockets.SocketException sockEx)
+        {
+            socketCode = $"Код сокета: {sockEx.ErrorCode} ({sockEx.SocketErrorCode})";
+        }
+        else if (ex.InnerException is System.Net.Sockets.SocketException innerSock)
+        {
+            socketCode = $"Код сокета: {innerSock.ErrorCode} ({innerSock.SocketErrorCode})";
+        }
+
+        var grid = new Grid();
+        grid.AddColumn(new GridColumn().Width(20));
+        grid.AddColumn();
+        grid.AddRow("[grey]Тип исключения:[reset]", $"[bold white]{Markup.Escape(exType)}[/]");
+        if (!string.IsNullOrEmpty(socketCode))
+        {
+            grid.AddRow("[grey]Сетевой код:[reset]", $"[bold yellow]{Markup.Escape(socketCode)}[/]");
+        }
+        grid.AddRow("[grey]Описание:[reset]", $"[white]{Markup.Escape(exMsg)}[/]");
+        if (!string.IsNullOrEmpty(proxyUrl))
+        {
+            grid.AddRow("[grey]Туннель:[reset]", $"[cyan]{Markup.Escape(proxyUrl)}[/]");
+        }
+
+        panel.AddRow(grid);
+        panel.AddEmptyRow();
+
+        panel.AddRow("[bold yellow]ПРИЧИНА И РЕШЕНИЕ:[reset]");
+        if (socketCode.Contains("10060") || exMsg.Contains("10060") || exMsg.Contains("TimedOut") || exMsg.Contains("требуемое время"))
+        {
+            panel.AddRow("[white]• [bold red]Таймаут соединения (10060):[/] Провайдер блокирует прямые IP-адреса Telegram MTProto.[/]");
+            panel.AddRow("[white]  [bold green]Решение:[/] Включите VPN (любой сервис) или запустите локальный TgWsProxy / ByeDPI.[/]");
+            panel.AddRow("[white]  Либо укажите рабочий публичный MTProxy в файле config.json: [cyan]\"proxy_url\": \"tg://proxy?...\"[/][/]");
+        }
+        else if (socketCode.Contains("10061") || exMsg.Contains("10061") || exMsg.Contains("refused"))
+        {
+            panel.AddRow("[white]• [bold red]Соединение отклонено (10061):[/] Указанный порт прокси недоступен (служба не запущена).[/]");
+            panel.AddRow("[white]  [bold green]Решение:[/] Если вы используете TgWsProxy, запустите его перед стартом программы.[/]");
+            panel.AddRow("[white]  Если прокси не нужен, удалите строчку proxy_url в config.json (оставьте null).[/]");
+        }
+        else
+        {
+            panel.AddRow("[white]• Проверьте стабильность интернет-соединения и корректность времени/даты на компьютере.[/]");
+            panel.AddRow("[white]• Если ошибка повторяется, настройте рабочий прокси-сервер в config.json.[/]");
+        }
+
+        AnsiConsole.Write(panel);
+        Console.WriteLine();
+
+        Console.Write("Хотите ввести/изменить адрес MTProxy прямо сейчас? (y/n): ");
+        string? ans = Console.ReadLine()?.Trim().ToLowerInvariant();
+        if (ans == "y" || ans == "yes" || ans == "д" || ans == "да")
+        {
+            Console.Write("Вставьте ссылку tg://proxy?server=... или host:port:secret: ");
+            string? newProxy = Console.ReadLine()?.Trim();
+            if (!string.IsNullOrWhiteSpace(newProxy))
+            {
+                if (!newProxy.StartsWith("tg://", StringComparison.OrdinalIgnoreCase) && newProxy.Contains(':'))
+                {
+                    var parts = newProxy.Split(':');
+                    if (parts.Length >= 3)
+                    {
+                        newProxy = $"tg://proxy?server={parts[0]}&port={parts[1]}&secret={parts[2]}";
+                    }
+                }
+                _config.ProxyUrl = newProxy;
+                SaveConfig(_config);
+                AnsiConsole.MarkupLine("[bold green][√] Новый прокси сохранен в config.json! Перезапустите программу.[/]");
+            }
+        }
+
+        AnsiConsole.MarkupLine("\n[bold cyan]Нажмите любую клавишу для выхода из программы...[/]");
+        try { Console.ReadKey(true); } catch { }
+    }
+
+    private static void ShowFatalCrash(Exception ex)
+    {
+        try
+        {
+            Console.WriteLine();
+            var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Red).Expand();
+            table.AddColumn(new TableColumn("[bold red]НЕОБРАБОТАННАЯ КРИТИЧЕСКАЯ ОШИБКА[/]"));
+            table.AddRow($"[bold white]Тип исключения:[/] {Markup.Escape(ex.GetType().FullName ?? ex.GetType().Name)}");
+            table.AddRow($"[bold white]Сообщение:[/] {Markup.Escape(ex.Message)}");
+            if (ex.InnerException != null)
+            {
+                table.AddRow($"[bold yellow]Вложенная причина:[/] {Markup.Escape(ex.InnerException.Message)}");
+            }
+            if (!string.IsNullOrEmpty(ex.StackTrace))
+            {
+                table.AddRow($"[grey]{Markup.Escape(Truncate(ex.StackTrace, 600))}[/]");
+            }
+            AnsiConsole.Write(table);
+
+            try
+            {
+                File.WriteAllText("crash_dump.log", $"{DateTime.UtcNow:u}\n{ex}", Encoding.UTF8);
+                AnsiConsole.MarkupLine("[grey]Технический стек ошибки записан в файл crash_dump.log[/]");
+            }
+            catch { }
+
+            AnsiConsole.MarkupLine("\n[bold cyan]Нажмите любую клавишу для закрытия окна...[/]");
+            Console.ReadKey(true);
+        }
+        catch
+        {
+            Console.WriteLine($"\nКритическая ошибка: {ex.Message}");
+            Console.WriteLine("Нажмите любую клавишу для закрытия...");
+            try { Console.ReadKey(true); } catch { }
         }
     }
 }
