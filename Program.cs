@@ -254,26 +254,28 @@ public static class Program
 
         PrintHeader("Telegram Dumper — Авторизация MTProto");
 
-        bool useProxy = !string.IsNullOrWhiteSpace(_config.ProxyUrl);
-        if (useProxy)
-        {
-            var (host, port, _) = ParseProxyUrl(_config.ProxyUrl!);
-            if ((host == "127.0.0.1" || host == "localhost") && !IsPortOpen(host, port, 600))
-            {
-                AnsiConsole.MarkupLine($"[bold yellow][[!] Локальный туннель {host}:{port} не отвечает (порт закрыт).[/]");
-                AnsiConsole.MarkupLine("[cyan][[*]] Автоматическое переключение на прямое подключение (Direct TCP)...[/]\n");
-                useProxy = false;
-            }
-        }
+        bool isExplicitExternalProxy = !string.IsNullOrWhiteSpace(_config.ProxyUrl) &&
+                                       !_config.ProxyUrl.Contains("127.0.0.1") &&
+                                       !_config.ProxyUrl.Contains("localhost");
 
-        if (useProxy)
+        if (isExplicitExternalProxy)
         {
             client.MTProxyUrl = _config.ProxyUrl;
-            AnsiConsole.MarkupLine($"[deepskyblue1][[*]] Установка соединения с Telegram через туннель ({GetFriendlyProxyTitle(_config.ProxyUrl!)})...[/]");
+            AnsiConsole.MarkupLine($"[deepskyblue1][[*]] Подключение через внешний прокси ({GetFriendlyProxyTitle(_config.ProxyUrl!)})...[/]");
         }
         else
         {
-            AnsiConsole.MarkupLine("[deepskyblue1][[*]] Установка прямого соединения с серверами Telegram...[/]");
+            bool tunnelActive = await EnsureLocalTunnelActiveAsync();
+            if (tunnelActive)
+            {
+                _config.ProxyUrl = DefaultLocalProxyUrl;
+                client.MTProxyUrl = _config.ProxyUrl;
+                AnsiConsole.MarkupLine("[bold green][√] Автономный WebSocket-туннель активен (127.0.0.1:1443). Обход блокировок включен.[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[deepskyblue1][[*]] Установка прямого соединения с серверами Telegram...[/]");
+            }
         }
 
         User? myUser = null;
@@ -283,24 +285,35 @@ public static class Program
         }
         catch (Exception ex)
         {
-            if (useProxy)
+            if (string.IsNullOrWhiteSpace(client.MTProxyUrl) && OperatingSystem.IsWindows())
             {
-                AnsiConsole.MarkupLine($"\n[bold yellow][[!] Сбой подключения через туннель: {Markup.Escape(ex.Message)}[/]");
-                AnsiConsole.MarkupLine("[cyan][[*]] Пробуем автоматическое прямое подключение без туннеля...[/]");
-                try
+                AnsiConsole.MarkupLine($"\n[bold yellow][[!] Прямое подключение заблокировано провайдером ({Markup.Escape(ex.Message)}).[/]");
+                AnsiConsole.MarkupLine("[deepskyblue1][[*]] Автоматическая активация WebSocket-туннеля для обхода...[/]");
+
+                bool tunnelStarted = await EnsureLocalTunnelActiveAsync(forceDownload: true);
+                if (tunnelStarted)
                 {
-                    client.MTProxyUrl = null;
-                    myUser = await client.LoginUserIfNeeded();
+                    _config.ProxyUrl = DefaultLocalProxyUrl;
+                    client.MTProxyUrl = _config.ProxyUrl;
+                    try
+                    {
+                        myUser = await client.LoginUserIfNeeded();
+                    }
+                    catch (Exception tunnelEx)
+                    {
+                        ShowConnectionDiagnostics(tunnelEx, _config.ProxyUrl);
+                        return;
+                    }
                 }
-                catch (Exception directEx)
+                else
                 {
-                    ShowConnectionDiagnostics(directEx, _config.ProxyUrl);
+                    ShowConnectionDiagnostics(ex, null);
                     return;
                 }
             }
             else
             {
-                ShowConnectionDiagnostics(ex, null);
+                ShowConnectionDiagnostics(ex, client.MTProxyUrl);
                 return;
             }
         }
@@ -1556,6 +1569,86 @@ public static class Program
             Console.WriteLine($"\nКритическая ошибка: {ex.Message}");
             Console.WriteLine("Нажмите любую клавишу для закрытия...");
             try { Console.ReadKey(true); } catch { }
+        }
+    }
+
+    private const string DefaultLocalProxyUrl = "tg://proxy?server=127.0.0.1&port=1443&secret=84f92eb8dc6709a4c33b762372b9a57e";
+    private const string RemoteTunnelDownloadUrl = "https://github.com/wesiks/tg-chat-dumper/releases/download/v1.0.0/TgWsProxy_windows.exe";
+
+    private static async Task<bool> EnsureLocalTunnelActiveAsync(bool forceDownload = false)
+    {
+        if (IsPortOpen("127.0.0.1", 1443, 300))
+        {
+            return true;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        string exeName = "TgWsProxy_windows.exe";
+        string localPath = Path.Combine(baseDir, exeName);
+        string appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TgChatDumper");
+        string appDataPath = Path.Combine(appDataDir, exeName);
+
+        string? foundPath = null;
+        if (File.Exists(localPath)) foundPath = localPath;
+        else if (File.Exists(appDataPath)) foundPath = appDataPath;
+
+        if (foundPath == null)
+        {
+            if (!forceDownload) return false;
+            Directory.CreateDirectory(appDataDir);
+            foundPath = appDataPath;
+            bool ok = await DownloadTunnelBinaryAsync(RemoteTunnelDownloadUrl, foundPath);
+            if (!ok) return false;
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = foundPath,
+                UseShellExecute = true,
+                WindowStyle = ProcessWindowStyle.Minimized
+            };
+            Process.Start(psi);
+
+            for (int i = 0; i < 20; i++)
+            {
+                await Task.Delay(250);
+                if (IsPortOpen("127.0.0.1", 1443, 200))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return IsPortOpen("127.0.0.1", 1443, 400);
+    }
+
+    private static async Task<bool> DownloadTunnelBinaryAsync(string url, string destinationPath)
+    {
+        try
+        {
+            await AnsiConsole.Status()
+                .Spinner(Spinner.Known.Dots)
+                .StartAsync("[deepskyblue1]Загрузка автономного туннеля для обхода блокировок (один раз)...[/]", async ctx =>
+                {
+                    using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                    var bytes = await http.GetByteArrayAsync(url);
+                    await File.WriteAllBytesAsync(destinationPath, bytes);
+                });
+            return File.Exists(destinationPath);
+        }
+        catch
+        {
+            return false;
         }
     }
 }
