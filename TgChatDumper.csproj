@@ -7,7 +7,18 @@
     <Nullable>enable</Nullable>
     <RootNamespace>TgChatDumper</RootNamespace>
     <AssemblyName>TgChatDumper</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>Telegram Restricted Chat &amp; Media Dumper</Product>
+    <Description>Direct MTProto Extraction · Bypasses UI Save Restrictions</Description>
+    <Authors>wesiks</Authors>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="app.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.57.2" />

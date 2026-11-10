@@ -1,6 +1,7 @@
 # Build & compiler output
 bin/
 obj/
+publish/
 
 # Telegram credentials & session files (Personal)
 sessions/*.session
