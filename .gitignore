@@ -1,0 +1,31 @@
+# Build & compiler output
+bin/
+obj/
+
+# Telegram credentials & session files (Personal)
+sessions/*.session
+sessions/*
+!sessions/.gitkeep
+
+# Chat dumps & downloaded media (Personal)
+dumps/*
+!dumps/.gitkeep
+*.dump
+
+# Local runtime machine config
+config.json
+
+# IDE & OS junk
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+Desktop.ini
+
+# Agent instructions & workspace configs
+.gemini/
+GEMINI.md
+gemini.md
+
+
