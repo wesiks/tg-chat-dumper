@@ -410,14 +410,14 @@ public static class Program
                     .Title("\n[bold cyan]Действия после дампа:[/] [grey](навигация ↑/↓, выбор Enter)[/]\n")
                     .HighlightStyle(new Style(foreground: Color.Cyan1, decoration: Decoration.Bold))
                     .AddChoices(
-                        "1. Открыть папку с файлами в Проводнике Windows",
+                        "1. Открыть папку с файлами в проводнике",
                         "2. Вернуться в главное меню"
                     );
 
                 string postChoice = AnsiConsole.Prompt(postPrompt);
                 if (postChoice.StartsWith("1."))
                 {
-                    try { Process.Start("explorer.exe", Path.GetFullPath(chatDumpDir)); } catch { }
+                    OpenFolderInFileManager(chatDumpDir);
                 }
             }
             else if (choice.StartsWith("2."))
@@ -1318,5 +1318,28 @@ public static class Program
             AnsiConsole.MarkupLine($"[grey]Аккаунт:[/]     [white]{Markup.Escape(userStr)}[/]");
         }
         Console.WriteLine();
+    }
+
+    private static void OpenFolderInFileManager(string path)
+    {
+        try
+        {
+            string fullPath = Path.GetFullPath(path);
+            if (OperatingSystem.IsWindows())
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", fullPath) { UseShellExecute = true });
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                Process.Start("open", fullPath);
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                Process.Start("xdg-open", fullPath);
+            }
+        }
+        catch
+        {
+        }
     }
 }
